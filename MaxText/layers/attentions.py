@@ -25,9 +25,11 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import shard_map
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
+from jax.experimental.pallas.ops.tpu.paged_attention import paged_attention
 import jax.numpy as jnp
 
 import common_types
+import page_managers
 from layers import embeddings
 from layers import initializers
 from layers import linears
@@ -105,6 +107,94 @@ def apply_mask_to_logits(logits: Array, mask: Array):
     Masked logits.
   """
   return jnp.where((mask >= DEFAULT_MASK_VALUE * 0.5), logits, DEFAULT_MASK_VALUE)
+
+
+class PagedAttentionOp(nn.Module):
+
+  num_kv_heads: int
+  num_pages: int
+  page_size: int
+  kv_head_dim_size: int
+  dtype: DType = jnp.float32
+
+  block_size: int
+
+  kv_pages_axis_names: AxisNames = ("kv_heads", "num_pages", "page_size", "kv_head_dim_size")
+  pages_per_compute_block: int = None
+
+  paged_manager: page_managers.PageManager
+
+  def setup(self):
+    """Initialize paged attention op."""
+    self.pages_per_compute_block = self.block_size // self.page_size
+    kv_pages_shape = (self.num_kv_heads, self.num_pages, self.page_size, self.kv_head_dim_size)
+    _ = self.variable(
+        "cache",
+        "key_pages",
+        nn.with_logical_partitioning(jnp.zeros, self.kv_pages_axis_names),
+        kv_pages_shape,
+        self.dtype,
+    )
+    _ = self.variable(
+        "cache",
+        "value_pages",
+        nn.with_logical_partitioning(jnp.zeros, self.kv_pages_axis_names),
+        kv_pages_shape,
+        self.dtype,
+    )
+
+  @property
+  def key_pages(self) -> nn.Variable:
+    return self.variable["cache"]["key_pages"]
+
+  @property
+  def value_pages(self) -> nn.Variable:
+    return self.variable["cache"]["value_pages"]
+
+  def dot_product_attention(
+      self,
+      query: Array,
+      key: Array,
+      value: Array,
+  ) -> Array:
+    """Apply Dot Product Attention.
+
+    Annotations:
+      b: batch size
+      t: query length
+      s: key / value length
+      d: head / kv dimension
+      n: number of query heads
+      n_kv: number of kv heads, sometimes annotated as k
+      n // n_kv: number of group for query, sometimes annotated with g
+    """
+    b, t, n, d = query.shape
+    _, _, n_kv, _ = key.shape
+    query = jnp.reshape(query, (b, t, n_kv, n // n_kv, d))
+    attn_weights = jnp.einsum("btkgd,bskd->bkgts", query, key)
+    max_attn_weights = jnp.max(attn_weights, axis=-1, keepdims=True)
+    exps_attn_weights = jnp.exp(attn_weights - max_attn_weights)
+    attn = jnp.einsum("bkgts,bskd->btkgd", exps_attn_weights, value)
+    return jnp.reshape(attn, (b, t, n, d))
+
+  @nn.compact
+  def __call__(self, query: Array, key: Array, value: Array, model_mode: str, slot: int = None) -> Array:
+
+    if model_mode == common_types.MODEL_MODE_PREFILL:
+      # TODO: this will be later move to insert
+      self.page_manager.update_prefill_step_pages(self.key_pages, self.value_pages, key, value, slot)
+      return self.dot_product_attention(query, key, value)
+
+    if model_mode == common_types.MODEL_MODE_AUTOREGRESSIVE:
+      self.page_manager.update_decode_step_pages(self.key_pages, self.value_pages, key, value)
+      return paged_attention(
+        q=query,
+        k_pages=self.key_pages.value,
+        v_pages=self.value_pages.value,
+        lengths=self.page_manager.seq_lengths.value,
+        page_indices=self.page_manager.seq_page_indices.value,
+        pages_per_compute_block=self.pages_per_compute_block
+      )
 
 
 class AttentionOp(nn.Module):
@@ -888,7 +978,7 @@ class Attention(nn.Module):
   ar_cache_axis_order: AxisIdxes = (1, 2, 0, 3)
   compute_axis_order: AxisIdxes = (0, 1, 2, 3)
   reshape_q: bool = False
-
+  page_manager: Optional[page_managers.PageManager] = None
 
   def query_projection(self, inputs_q: Array) -> Array:
     """Query projection."""
@@ -1036,7 +1126,19 @@ class Attention(nn.Module):
     value = checkpoint_name(value, "value_proj")
 
     assert not self.config.quantize_kvcache or self.kv_quant
-    attention_op = AttentionOp(
+
+    if self.config.paged_attention:
+      attention_op = PagedAttentionOp(
+        num_kv_heads=self.num_kv_heads,
+        num_pages=self.config.num_pages,
+        page_size=self.config.page_size,
+        block_size=self.config.block_size,
+        kv_head_dim_size=self.head_dim,
+        dtype=self.dtype,
+        paged_manager=self.page_manager,
+      )
+    else:
+      attention_op = AttentionOp(
         mesh=self.mesh,
         attention_kernel=self.attention_kernel,
         max_target_length=self.max_target_length,

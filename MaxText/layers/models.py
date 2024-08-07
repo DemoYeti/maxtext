@@ -24,6 +24,7 @@ import functools
 import jax
 import jax.numpy as jnp
 import common_types
+import page_managers
 from layers import attentions
 from layers import embeddings
 from layers import linears
@@ -402,6 +403,7 @@ class Transformer(nn.Module):
   config: Config
   mesh: Mesh
   quant: Quant
+  page_manager: Optional[page_managers.PageManager] = None
 
   def setup(self):
     """Initialize shared_embedding & decoder layers."""
@@ -418,7 +420,13 @@ class Transformer(nn.Module):
         config=cfg,
     )
 
-    self.decoder = Decoder(config=cfg, shared_embedding=self.shared_embedding, mesh=mesh, quant=self.quant)
+    self.decoder = Decoder(
+      config=cfg,
+      shared_embedding=self.shared_embedding,
+      mesh=mesh,
+      quant=self.quant,
+      page_manager=self.page_manager
+    )
 
   def __call__(
       self,

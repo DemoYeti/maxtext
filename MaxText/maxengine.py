@@ -28,6 +28,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 import common_types
+import page_managers
 from jetstream.engine import engine_api
 from jetstream.engine import tokenizer_pb2
 from jetstream.engine import tokenizer_api
@@ -69,7 +70,17 @@ class MaxEngine(engine_api.Engine):
 
     # Model and Optimizer definition
     quant = quantizations.configure_quantization(config)
-    self.model = models.Transformer(config, mesh=self._mesh, quant=quant)
+
+    self.page_manager = None
+    if self.config.attention == "paged_attention":
+      self.page_manager = page_managers.PageManager(
+        max_num_sequences=self.max_concurrent_decode,
+        max_target_length=self.config.max_target_length,
+        page_size=self.config.page_size,
+        num_pages=self.config.num_pages,
+      )
+
+    self.model = models.Transformer(config, mesh=self._mesh, quant=quant, page_manager=self.page_manager)
     self.replicated_sharding = jax.sharding.NamedSharding(self._mesh, P(None))
 
     self.abstract_params = None
@@ -137,6 +148,7 @@ class MaxEngine(engine_api.Engine):
       existing_prefix: Optional[jax.Array] = None,
       padded_tokens: jax.Array,
       true_length: int,
+      slot: int,
   ) -> Tuple[Prefix, engine_api.ResultTokens]:
     """Computes a kv-cache for a new generate request.
 
@@ -160,6 +172,9 @@ class MaxEngine(engine_api.Engine):
     ones_to_keep = zero_to_n < true_length
     one_d_output = ones_to_keep * common_types.DECODING_ACTIVE_SEQUENCE_INDICATOR
     sequence_indicator = jnp.expand_dims(one_d_output, 0)
+    
+    if self.page_manager:
+      self.page_manager.assign_prefill_step_pages(slot=slot, true_length=true_length)
 
     with self._mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
       flat_logits, new_vars = self.model.apply(
@@ -171,6 +186,7 @@ class MaxEngine(engine_api.Engine):
           model_mode=common_types.MODEL_MODE_PREFILL,
           rngs={"params": self.rng},
           mutable=["cache"],
+          slot=slot
       )
 
     next_pos = jnp.full((1, 1), true_length, dtype=jnp.int32)
@@ -218,6 +234,9 @@ class MaxEngine(engine_api.Engine):
   def generate(self, params: Params, decode_state: DecodeState) -> Tuple[DecodeState, engine_api.ResultTokens]:
     """Run one generate step"""
     previous_token = decode_state["tokens"]
+
+    if self.page_manager:
+      self.page_manager.assign_decode_step_pages()
 
     # run one step generation
     with self._mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
